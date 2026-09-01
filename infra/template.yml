@@ -122,10 +122,10 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query, dynamodb:Scan]
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:Scan]
                 Resource: [!GetAtt ProfilesTable.Arn, !GetAtt DiaryTable.Arn, !GetAtt BillingTable.Arn, !GetAtt ListingsTable.Arn, !GetAtt OrdersTable.Arn]
               - Effect: Allow
-                Action: [s3:GetObject, s3:PutObject]
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
                 Resource: !Sub '${AssetsBucket.Arn}/*'
               - Effect: Allow
                 Action: [bedrock:InvokeModel, bedrock:Converse]
@@ -377,6 +377,16 @@ Resources:
                       if not data.get("crop") or quantity <= 0 or price <= 0: return response(400, {"error": "crop, positive quantity and price are required"})
                       item = {"listingId": str(uuid.uuid4()), "farmerId": user_id, "farmer": profile.get("name"), "farm": profile.get("farm"), "place": profile.get("place"), "state": profile.get("state"), "latitude": profile.get("latitude"), "longitude": profile.get("longitude"), "crop": str(data["crop"])[:80], "quantity": str(quantity), "price": str(price), "unit": "kg", "description": str(data.get("description", ""))[:500], "imageKey": str(data.get("imageKey", ""))[:300], "createdAt": datetime.now(timezone.utc).isoformat(), "status": "Available"}
                       listings_table.put_item(Item=item); return response(201, item)
+                  if method == "DELETE":
+                      data = body(event); listing_id = str(data.get("listingId", ""))
+                      listing = listings_table.get_item(Key={"listingId": listing_id}).get("Item")
+                      if not listing: return response(404, {"error": "product listing not found"})
+                      if listing.get("farmerId") != user_id: return response(403, {"error": "you can only remove your own products"})
+                      listings_table.delete_item(Key={"listingId": listing_id}, ConditionExpression="farmerId=:farmer", ExpressionAttributeValues={":farmer": user_id})
+                      if listing.get("imageKey"):
+                          try: s3.delete_object(Bucket=os.environ["ASSETS_BUCKET"], Key=listing["imageKey"])
+                          except Exception as error: print("listing image cleanup error:", repr(error))
+                      return response(200, {"message": "product removed", "listingId": listing_id})
               if path == "/orders":
                   if method == "GET": return response(200, {"items": orders_table.query(KeyConditionExpression=Key("userId").eq(user_id), ScanIndexForward=False, Limit=50).get("Items", [])})
                   if method == "POST":
