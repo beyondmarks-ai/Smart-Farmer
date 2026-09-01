@@ -86,7 +86,7 @@ Resources:
       UsernameAttributes: [email]
       Policies:
         SignInPolicy:
-          AllowedFirstAuthFactors: [PASSWORD, EMAIL_OTP]
+          AllowedFirstAuthFactors: [PASSWORD]
       UserPoolAddOns: { AdvancedSecurityMode: AUDIT }
 
   UserPoolClient:
@@ -95,7 +95,7 @@ Resources:
       ClientName: smart-farmer-web
       UserPoolId: !Ref UserPool
       GenerateSecret: false
-      ExplicitAuthFlows: [ALLOW_USER_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
       PreventUserExistenceErrors: ENABLED
 
   ExternalApiSecret:
@@ -228,7 +228,10 @@ Resources:
                   if "@" not in email:
                       return response(400, {"error": "enter a valid email address"})
                   try:
-                      cognito.sign_up(ClientId=os.environ["COGNITO_CLIENT_ID"], Username=email, UserAttributes=[{"Name": "email", "Value": email}])
+                      password = str(data.get("password", ""))
+                      if len(password) < 8:
+                          return response(400, {"error": "password must be at least 8 characters"})
+                      cognito.sign_up(ClientId=os.environ["COGNITO_CLIENT_ID"], Username=email, Password=password, UserAttributes=[{"Name": "email", "Value": email}])
                       return response(201, {"message": "verification code sent", "email": email})
                   except cognito.exceptions.UsernameExistsException:
                       return response(409, {"error": "an account with this email already exists"})
@@ -237,7 +240,8 @@ Resources:
               if path == "/confirm" and method == "POST":
                   data = body(event)
                   try:
-                      cognito.confirm_sign_up(ClientId=os.environ["COGNITO_CLIENT_ID"], Username=str(data.get("email", "")).strip().lower(), ConfirmationCode=str(data.get("code", "")).strip())
+                      email = str(data.get("email", "")).strip().lower()
+                      cognito.confirm_sign_up(ClientId=os.environ["COGNITO_CLIENT_ID"], Username=email, ConfirmationCode=str(data.get("code", "")).strip())
                       return response(200, {"message": "account verified"})
                   except Exception as error:
                       return response(400, {"error": str(error).split(":", 1)[-1].strip()})
@@ -247,21 +251,29 @@ Resources:
                       email = str(data.get("email", "")).strip().lower()
                       if "@" not in email:
                           return response(400, {"error": "enter a valid email address"})
-                      if data.get("code") and data.get("session"):
-                          auth = cognito.respond_to_auth_challenge(ClientId=os.environ["COGNITO_CLIENT_ID"], ChallengeName="EMAIL_OTP", Session=str(data["session"]), ChallengeResponses={"USERNAME": email, "EMAIL_OTP_CODE": str(data["code"]).strip()})["AuthenticationResult"]
-                          return response(200, {"accessToken": auth["AccessToken"], "idToken": auth["IdToken"], "expiresIn": auth["ExpiresIn"]})
-                      challenge = cognito.initiate_auth(ClientId=os.environ["COGNITO_CLIENT_ID"], AuthFlow="USER_AUTH", AuthParameters={"USERNAME": email, "PREFERRED_CHALLENGE": "EMAIL_OTP"})
-                      return response(200, {"message": "one-time code sent", "session": challenge.get("Session"), "challenge": challenge.get("ChallengeName")})
+                      password = str(data.get("password", ""))
+                      if not password:
+                          return response(400, {"error": "password is required"})
+                      auth = cognito.initiate_auth(ClientId=os.environ["COGNITO_CLIENT_ID"], AuthFlow="USER_PASSWORD_AUTH", AuthParameters={"USERNAME": email, "PASSWORD": password})["AuthenticationResult"]
+                      return response(200, {"accessToken": auth["AccessToken"], "idToken": auth["IdToken"], "expiresIn": auth["ExpiresIn"]})
                   except Exception:
-                      return response(401, {"error": "unable to send or verify the one-time code. Check that your email is verified."})
+                      return response(401, {"error": "incorrect email or password, or the email has not been verified"})
               if path == "/weather" and method == "GET":
                   query = event.get("queryStringParameters") or {}
                   try:
-                      lat, lng = float(query.get("lat", "22.7196")), float(query.get("lng", "75.8577"))
+                      if query.get("lat") and query.get("lng"):
+                          lat, lng = float(query["lat"]), float(query["lng"])
+                      else:
+                          place = str(query.get("place", "")).strip()[:120]
+                          state = str(query.get("state", "")).strip()[:80]
+                          if not place or not state:
+                              raise ValueError
+                          point = location.search_place_index_for_text(IndexName=os.environ["PLACE_INDEX"], Text=place + ", " + state + ", India", MaxResults=1)["Results"][0]["Place"]["Geometry"]["Point"]
+                          lng, lat = float(point[0]), float(point[1])
                       if not (-90 <= lat <= 90 and -180 <= lng <= 180):
                           raise ValueError
-                  except ValueError:
-                      return response(400, {"error": "valid lat and lng are required"})
+                  except (ValueError, IndexError, KeyError):
+                      return response(400, {"error": "a valid city and state or coordinates are required"})
                   if provider_keys is None:
                       provider_keys = json.loads(secrets.get_secret_value(SecretId=os.environ["EXTERNAL_API_SECRET"])["SecretString"])
                   params = urlencode({"key": provider_keys["WEATHER_API_KEY"], "location.latitude": lat, "location.longitude": lng, "unitsSystem": "METRIC"})
@@ -375,6 +387,13 @@ Resources:
                       try: quantity = float(data.get("quantity", 0))
                       except (TypeError, ValueError): return response(400, {"error": "quantity must be a number"})
                       if quantity <= 0 or quantity > float(listing["quantity"]): return response(400, {"error": "choose a quantity within available stock"})
+                      delivery = {"recipientName": str(data.get("recipientName", "")).strip()[:100], "phone": str(data.get("phone", "")).strip()[:15], "addressLine1": str(data.get("addressLine1", "")).strip()[:200], "addressLine2": str(data.get("addressLine2", "")).strip()[:150], "landmark": str(data.get("landmark", "")).strip()[:120], "city": str(data.get("city", "")).strip()[:100], "state": str(data.get("deliveryState", "")).strip()[:80], "pincode": str(data.get("pincode", "")).strip()[:6], "instructions": str(data.get("deliveryInstructions", "")).strip()[:300]}
+                      if not all(delivery.get(field) for field in ("recipientName", "phone", "addressLine1", "addressLine2", "city", "state", "pincode")):
+                          return response(400, {"error": "complete all required delivery address fields"})
+                      if len(delivery["phone"]) != 10 or not delivery["phone"].isdigit() or delivery["phone"][0] not in "6789":
+                          return response(400, {"error": "enter a valid 10-digit Indian mobile number"})
+                      if len(delivery["pincode"]) != 6 or not delivery["pincode"].isdigit() or delivery["pincode"][0] == "0":
+                          return response(400, {"error": "enter a valid 6-digit PIN code"})
                       if provider_keys is None: provider_keys = json.loads(secrets.get_secret_value(SecretId=os.environ["EXTERNAL_API_SECRET"])["SecretString"])
                       key_id, key_secret = provider_keys.get("RAZORPAY_KEY_ID"), provider_keys.get("RAZORPAY_KEY_SECRET")
                       if not key_id or not key_secret: return response(503, {"error": "online payments are being configured"})
@@ -386,7 +405,7 @@ Resources:
                           with urlopen(Request("https://api.razorpay.com/v1/orders", data=request_data, headers={"Authorization": authorization, "Content-Type": "application/json"}, method="POST"), timeout=10) as result: razorpay_order = json.load(result)
                       except Exception as error:
                           print("razorpay order error:", repr(error)); return response(502, {"error": "payment service is temporarily unavailable"})
-                      item = {"userId": user_id, "orderId": order_id, "razorpayOrderId": razorpay_order["id"], "listingId": listing["listingId"], "farmerId": listing["farmerId"], "customer": profile.get("name"), "crop": listing["crop"], "quantity": str(quantity), "total": str(total), "status": "Payment pending", "date": datetime.now(timezone.utc).date().isoformat()}
+                      item = {"userId": user_id, "orderId": order_id, "razorpayOrderId": razorpay_order["id"], "listingId": listing["listingId"], "farmerId": listing["farmerId"], "customer": profile.get("name"), "delivery": delivery, "crop": listing["crop"], "quantity": str(quantity), "total": str(total), "status": "Payment pending", "date": datetime.now(timezone.utc).date().isoformat()}
                       orders_table.put_item(Item=item); return response(201, {**item, "keyId": key_id, "amount": amount, "currency": "INR", "farm": listing.get("farm")})
               if path == "/payments/verify" and method == "POST":
                   data = body(event); order_id = str(data.get("orderId", "")); item = orders_table.get_item(Key={"userId": user_id, "orderId": order_id}).get("Item")

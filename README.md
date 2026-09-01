@@ -34,8 +34,8 @@ Copy `.env.example` to `.env.local` only for local API overrides. Never commit `
 - The browser never receives Google Weather, data.gov.in, AWS, or Razorpay secret keys.
 - Lambda retrieves provider credentials from AWS Secrets Manager.
 - Razorpay’s publishable order key may be sent to the checkout browser; its secret remains in Secrets Manager.
-- Farmers and customers authenticate with Cognito email one-time codes. The website does not collect, create, or use passwords.
-- Cognito retains its password factor only for compatibility with the existing user pool; SmartFarmer requests the email OTP challenge exclusively.
+- Farmers and customers authenticate with Cognito email and password. New accounts receive a one-time email verification code before their first sign-in.
+- Passwords are submitted directly to Cognito through the authentication API and are never stored by SmartFarmer.
 - End users need no AWS CLI, no API key, and no cloud credentials. The AWS CLI is only needed by administrators to deploy or operate infrastructure.
 - Dynamic features still require backend APIs: login, weather, mandi prices, listings, image upload, payments, invoices, and AI assistance.
 
