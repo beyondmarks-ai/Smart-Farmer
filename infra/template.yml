@@ -1,0 +1,621 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: SmartFarmer core AWS infrastructure
+
+Parameters:
+  BedrockModelId:
+    Type: String
+    Default: apac.amazon.nova-lite-v1:0
+
+Resources:
+  AssetsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT]
+            AllowedOrigins: ['https://main.d3uorrhappvzqr.amplifyapp.com', 'http://localhost:3000']
+            MaxAge: 3600
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration: { Status: Enabled }
+
+  ProfilesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: userId, AttributeType: S }]
+      KeySchema: [{ AttributeName: userId, KeyType: HASH }]
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+
+  DiaryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+        - { AttributeName: recordId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+        - { AttributeName: recordId, KeyType: RANGE }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+
+  BillingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+        - { AttributeName: invoiceId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+        - { AttributeName: invoiceId, KeyType: RANGE }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+
+  ListingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: listingId, AttributeType: S }]
+      KeySchema: [{ AttributeName: listingId, KeyType: HASH }]
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+        - { AttributeName: orderId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+        - { AttributeName: orderId, KeyType: RANGE }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: smart-farmer-users
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        SignInPolicy:
+          AllowedFirstAuthFactors: [PASSWORD, EMAIL_OTP]
+      UserPoolAddOns: { AdvancedSecurityMode: AUDIT }
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: smart-farmer-web
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+
+  ExternalApiSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: smart-farmer/external-apis
+      Description: Weather and mandi provider configuration
+      SecretString: '{"WEATHER_API_KEY":"REPLACE_ME","MANDI_API_KEY":"REPLACE_ME"}'
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SmartFarmerDataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query, dynamodb:Scan]
+                Resource: [!GetAtt ProfilesTable.Arn, !GetAtt DiaryTable.Arn, !GetAtt BillingTable.Arn, !GetAtt ListingsTable.Arn, !GetAtt OrdersTable.Arn]
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub '${AssetsBucket.Arn}/*'
+              - Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:Converse]
+                Resource: '*'
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !Ref ExternalApiSecret
+              - Effect: Allow
+                Action: [polly:SynthesizeSpeech, transcribe:StartTranscriptionJob, translate:TranslateText, ses:SendEmail, sms-voice:SendTextMessage, geo:GetMap*, geo:SearchPlaceIndexForText, geo-maps:GetStaticMap]
+                Resource: '*'
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: smart-farmer-api
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt ApiRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          PROFILES_TABLE: !Ref ProfilesTable
+          DIARY_TABLE: !Ref DiaryTable
+          BILLING_TABLE: !Ref BillingTable
+          LISTINGS_TABLE: !Ref ListingsTable
+          ORDERS_TABLE: !Ref OrdersTable
+          ASSETS_BUCKET: !Ref AssetsBucket
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          EXTERNAL_API_SECRET: !Ref ExternalApiSecret
+          COGNITO_CLIENT_ID: !Ref UserPoolClient
+          PLACE_INDEX: !Ref PlaceIndex
+          MAP_API_KEY: !Ref InteractiveMapKey
+      Code:
+        ZipFile: |
+          import base64, hashlib, hmac, json, math, os, uuid
+          from datetime import datetime, timezone
+          from urllib.parse import urlencode
+          from urllib.request import Request, urlopen
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          bedrock = boto3.client("bedrock-runtime")
+          secrets = boto3.client("secretsmanager")
+          s3 = boto3.client("s3")
+          ddb = boto3.resource("dynamodb")
+          diary_table = ddb.Table(os.environ["DIARY_TABLE"])
+          billing_table = ddb.Table(os.environ["BILLING_TABLE"])
+          profiles_table = ddb.Table(os.environ["PROFILES_TABLE"])
+          listings_table = ddb.Table(os.environ["LISTINGS_TABLE"])
+          orders_table = ddb.Table(os.environ["ORDERS_TABLE"])
+          cognito = boto3.client("cognito-idp")
+          location = boto3.client("location")
+          maps = boto3.client("geo-maps")
+          provider_keys = None
+
+          def response(status, body):
+              return {"statusCode": status, "headers": {"content-type": "application/json", "access-control-allow-origin": "*", "access-control-allow-headers": "content-type,authorization", "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS"}, "body": json.dumps(body)}
+
+          def body(event):
+              return json.loads(event.get("body") or "{}")
+
+          def simple_pdf(lines):
+              text = " BT /F1 12 Tf 50 780 Td 16 TL " + " ".join("(" + str(line).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)") + ") Tj T*" for line in lines) + " ET "
+              objects = ["1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj", "2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj", "3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj", "4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj", f"5 0 obj << /Length {len(text)} >> stream\n{text}\nendstream endobj"]
+              pdf, offsets = "%PDF-1.4\n", [0]
+              for item in objects:
+                  offsets.append(len(pdf.encode()))
+                  pdf += item + "\n"
+              xref = len(pdf.encode())
+              pdf += "xref\n0 6\n0000000000 65535 f \n" + "".join(f"{offset:010d} 00000 n \n" for offset in offsets[1:]) + f"trailer << /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF"
+              return pdf.encode()
+
+          def authenticated_user(event):
+              headers = {str(key).lower(): value for key, value in event.get("headers", {}).items()}
+              token = headers.get("authorization", "").removeprefix("Bearer ").strip()
+              if not token:
+                  return None
+              try:
+                  user = cognito.get_user(AccessToken=token)
+                  return next((item["Value"] for item in user["UserAttributes"] if item["Name"] == "sub"), user["Username"])
+              except Exception:
+                  return None
+
+          def distance_km(a, b):
+              lat1, lon1, lat2, lon2 = map(math.radians, [float(a["latitude"]), float(a["longitude"]), float(b["latitude"]), float(b["longitude"])])
+              return 6371 * 2 * math.asin(math.sqrt(math.sin((lat2-lat1)/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin((lon2-lon1)/2)**2))
+
+          def handler(event, context):
+              global provider_keys
+              path = event.get("rawPath", "/")
+              method = event.get("requestContext", {}).get("http", {}).get("method", "GET")
+              if method == "OPTIONS":
+                  return response(204, {})
+              if path == "/health":
+                  return response(200, {"status": "ok", "service": "smart-farmer"})
+              if path == "/signup" and method == "POST":
+                  data = body(event)
+                  email = str(data.get("email", "")).strip().lower()
+                  if "@" not in email:
+                      return response(400, {"error": "enter a valid email address"})
+                  try:
+                      cognito.sign_up(ClientId=os.environ["COGNITO_CLIENT_ID"], Username=email, UserAttributes=[{"Name": "email", "Value": email}])
+                      return response(201, {"message": "verification code sent", "email": email})
+                  except cognito.exceptions.UsernameExistsException:
+                      return response(409, {"error": "an account with this email already exists"})
+                  except Exception as error:
+                      return response(400, {"error": str(error).split(":", 1)[-1].strip()})
+              if path == "/confirm" and method == "POST":
+                  data = body(event)
+                  try:
+                      cognito.confirm_sign_up(ClientId=os.environ["COGNITO_CLIENT_ID"], Username=str(data.get("email", "")).strip().lower(), ConfirmationCode=str(data.get("code", "")).strip())
+                      return response(200, {"message": "account verified"})
+                  except Exception as error:
+                      return response(400, {"error": str(error).split(":", 1)[-1].strip()})
+              if path == "/login" and method == "POST":
+                  data = body(event)
+                  try:
+                      email = str(data.get("email", "")).strip().lower()
+                      if "@" not in email:
+                          return response(400, {"error": "enter a valid email address"})
+                      if data.get("code") and data.get("session"):
+                          auth = cognito.respond_to_auth_challenge(ClientId=os.environ["COGNITO_CLIENT_ID"], ChallengeName="EMAIL_OTP", Session=str(data["session"]), ChallengeResponses={"USERNAME": email, "EMAIL_OTP_CODE": str(data["code"]).strip()})["AuthenticationResult"]
+                          return response(200, {"accessToken": auth["AccessToken"], "idToken": auth["IdToken"], "expiresIn": auth["ExpiresIn"]})
+                      challenge = cognito.initiate_auth(ClientId=os.environ["COGNITO_CLIENT_ID"], AuthFlow="USER_AUTH", AuthParameters={"USERNAME": email, "PREFERRED_CHALLENGE": "EMAIL_OTP"})
+                      return response(200, {"message": "one-time code sent", "session": challenge.get("Session"), "challenge": challenge.get("ChallengeName")})
+                  except Exception:
+                      return response(401, {"error": "unable to send or verify the one-time code. Check that your email is verified."})
+              if path == "/weather" and method == "GET":
+                  query = event.get("queryStringParameters") or {}
+                  try:
+                      lat, lng = float(query.get("lat", "22.7196")), float(query.get("lng", "75.8577"))
+                      if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+                          raise ValueError
+                  except ValueError:
+                      return response(400, {"error": "valid lat and lng are required"})
+                  if provider_keys is None:
+                      provider_keys = json.loads(secrets.get_secret_value(SecretId=os.environ["EXTERNAL_API_SECRET"])["SecretString"])
+                  params = urlencode({"key": provider_keys["WEATHER_API_KEY"], "location.latitude": lat, "location.longitude": lng, "unitsSystem": "METRIC"})
+                  try:
+                      with urlopen("https://weather.googleapis.com/v1/currentConditions:lookup?" + params, timeout=8) as result:
+                          weather = json.load(result)
+                      return response(200, {"temperature": weather["temperature"]["degrees"], "condition": weather["weatherCondition"]["description"]["text"], "humidity": weather["relativeHumidity"], "wind": weather["wind"]["speed"]["value"], "rain": weather.get("precipitation", {}).get("probability", {}).get("percent", 0)})
+                  except Exception:
+                      return response(502, {"error": "weather provider unavailable"})
+              if path == "/mandi" and method == "GET":
+                  query = event.get("queryStringParameters") or {}
+                  state = query.get("state", "Madhya Pradesh").strip()[:80]
+                  crops = [crop.strip()[:80] for crop in query.get("crops", query.get("crop", "")).split(",") if crop.strip()]
+                  if not state:
+                      return response(400, {"error": "state is required"})
+                  if provider_keys is None:
+                      provider_keys = json.loads(secrets.get_secret_value(SecretId=os.environ["EXTERNAL_API_SECRET"])["SecretString"])
+                  prices, seen = [], set()
+                  try:
+                      for requested_crop in crops or [""]:
+                          # data.gov.in intermittently ignores state filters; fetch one public page and rank the requested state locally.
+                          params = urlencode({"api-key": provider_keys["MANDI_API_KEY"], "format": "json", "limit": 1000})
+                          url = "https://api.data.gov.in/resource/" + provider_keys["MANDI_RESOURCE_ID"] + "?" + params
+                          with urlopen(Request(url, headers={"User-Agent": "SmartFarmer/1.0"}), timeout=10) as result:
+                              payload = json.load(result)
+                          for item in payload.get("records", []):
+                              crop = str(item.get("commodity", "")).strip()
+                              aliases = {"cotton":["cotton"], "rice":["rice","paddy"], "paddy":["rice","paddy"], "soybean":["soybean","soyabean"], "soyabean":["soybean","soyabean"]}
+                              terms = aliases.get(requested_crop.lower(), [requested_crop.lower()])
+                              if not crop or (requested_crop and not any(term in crop.lower() for term in terms)):
+                                  continue
+                              item_state = str(item.get("state", "")).strip()
+                              # Overview needs one useful quote per crop; a crop search may show multiple mandis.
+                              key = crop.lower() if not requested_crop else crop.lower() + "|" + str(item.get("market", "")) + "|" + item_state
+                              if key in seen:
+                                  continue
+                              seen.add(key)
+                              def kg(value):
+                                  try: return round(float(str(value).replace(",", "")) / 100, 2)
+                                  except (TypeError, ValueError): return value
+                              prices.append({"crop": crop, "market": item.get("market"), "district": item.get("district"), "state": item_state or state, "price": kg(item.get("modal_price")), "min": kg(item.get("min_price")), "max": kg(item.get("max_price")), "unit": "kg", "date": item.get("arrival_date")})
+                              if len(prices) == 12:
+                                  break
+                          if len(prices) == 12:
+                              break
+                      prices.sort(key=lambda item: 0 if item.get("state", "").lower() == state.lower() else 1)
+                      return response(200, {"source": "AGMARKNET via data.gov.in", "state": state, "prices": prices})
+                  except Exception as error:
+                      print("mandi provider error:", repr(error))
+                      return response(502, {"error": "mandi provider unavailable"})
+              user_id = authenticated_user(event)
+              if not user_id:
+                  return response(401, {"error": "please sign in again"})
+              if path == "/diary" and method == "GET":
+                  items = diary_table.query(KeyConditionExpression=Key("userId").eq(user_id), ScanIndexForward=False, Limit=30).get("Items", [])
+                  return response(200, {"items": items})
+              if path == "/diary" and method == "POST":
+                  data = body(event)
+                  if not data.get("title") or not data.get("crop"):
+                      return response(400, {"error": "activity and crop are required"})
+                  item = {"userId": user_id, "recordId": datetime.now(timezone.utc).isoformat() + "#" + str(uuid.uuid4()), "title": data["title"][:100], "crop": data["crop"][:80], "field": data.get("field", "Main field")[:80], "notes": data.get("notes", "")[:500], "date": data.get("date") or datetime.now(timezone.utc).date().isoformat()}
+                  diary_table.put_item(Item=item)
+                  return response(201, item)
+              if path == "/profile":
+                  if method == "GET":
+                      return response(200, profiles_table.get_item(Key={"userId": user_id}).get("Item", {"userId": user_id, "onboarded": False}))
+                  if method == "PUT":
+                      data = body(event)
+                      role = str(data.get("role", "farmer")) if str(data.get("role", "farmer")) in ("farmer", "customer") else "farmer"
+                      item = {"userId": user_id, "role": role, "name": str(data.get("name", ""))[:100], "farm": str(data.get("farm", ""))[:100], "place": str(data.get("place", ""))[:120], "acres": str(data.get("acres", ""))[:20], "state": str(data.get("state", ""))[:80], "crops": str(data.get("crops", ""))[:300], "onboarded": True}
+                      if not item["name"] or not item["place"] or not item["state"] or (role == "farmer" and (not item["farm"] or not item["crops"])):
+                          return response(400, {"error": "complete all required account and location fields"})
+                      try:
+                          found = location.search_place_index_for_text(IndexName=os.environ["PLACE_INDEX"], Text=item["place"] + ", " + item["state"] + ", India", MaxResults=1)["Results"][0]["Place"]["Geometry"]["Point"]
+                          item["longitude"], item["latitude"] = str(found[0]), str(found[1])
+                      except Exception:
+                          return response(400, {"error": "location was not found; enter a nearby village or city and state"})
+                      profiles_table.put_item(Item=item)
+                      return response(200, item)
+              if path == "/farm-map" and method == "GET":
+                  profile = profiles_table.get_item(Key={"userId": user_id}).get("Item", {})
+                  if not profile.get("latitude"):
+                      return response(400, {"error": "save a valid profile location first"})
+                  farms = []
+                  for farm in profiles_table.scan(Limit=100).get("Items", []):
+                      if farm.get("role", "farmer") == "farmer" and farm.get("latitude") and distance_km(profile, farm) <= 50:
+                          farms.append({"name": farm.get("farm"), "place": farm.get("place"), "latitude": farm.get("latitude"), "longitude": farm.get("longitude"), "distance": round(distance_km(profile, farm), 1)})
+                  return response(200, {"mapKey": os.environ["MAP_API_KEY"], "region": os.environ["AWS_REGION"], "farms": farms, "center": {"latitude": profile["latitude"], "longitude": profile["longitude"]}})
+              if path == "/listings":
+                  if method == "GET":
+                      items = listings_table.scan(Limit=100).get("Items", [])
+                      for item in items:
+                          if item.get("imageKey"):
+                              item["imageUrl"] = s3.generate_presigned_url("get_object", Params={"Bucket": os.environ["ASSETS_BUCKET"], "Key": item["imageKey"]}, ExpiresIn=3600)
+                      return response(200, {"items": sorted(items, key=lambda x: x.get("createdAt", ""), reverse=True)})
+                  if method == "POST":
+                      profile, data = profiles_table.get_item(Key={"userId": user_id}).get("Item", {}), body(event)
+                      if profile.get("role", "farmer") != "farmer": return response(403, {"error": "only farmers can publish produce"})
+                      try: quantity, price = float(data.get("quantity", 0)), float(data.get("price", 0))
+                      except (TypeError, ValueError): return response(400, {"error": "quantity and price must be numbers"})
+                      if not data.get("crop") or quantity <= 0 or price <= 0: return response(400, {"error": "crop, positive quantity and price are required"})
+                      item = {"listingId": str(uuid.uuid4()), "farmerId": user_id, "farmer": profile.get("name"), "farm": profile.get("farm"), "place": profile.get("place"), "state": profile.get("state"), "latitude": profile.get("latitude"), "longitude": profile.get("longitude"), "crop": str(data["crop"])[:80], "quantity": str(quantity), "price": str(price), "unit": "kg", "description": str(data.get("description", ""))[:500], "imageKey": str(data.get("imageKey", ""))[:300], "createdAt": datetime.now(timezone.utc).isoformat(), "status": "Available"}
+                      listings_table.put_item(Item=item); return response(201, item)
+              if path == "/orders":
+                  if method == "GET": return response(200, {"items": orders_table.query(KeyConditionExpression=Key("userId").eq(user_id), ScanIndexForward=False, Limit=50).get("Items", [])})
+                  if method == "POST":
+                      profile, data = profiles_table.get_item(Key={"userId": user_id}).get("Item", {}), body(event)
+                      if profile.get("role") != "customer": return response(403, {"error": "use a customer account to buy produce"})
+                      listing = listings_table.get_item(Key={"listingId": str(data.get("listingId", ""))}).get("Item")
+                      if not listing or listing.get("status") != "Available": return response(404, {"error": "produce is no longer available"})
+                      try: quantity = float(data.get("quantity", 0))
+                      except (TypeError, ValueError): return response(400, {"error": "quantity must be a number"})
+                      if quantity <= 0 or quantity > float(listing["quantity"]): return response(400, {"error": "choose a quantity within available stock"})
+                      if provider_keys is None: provider_keys = json.loads(secrets.get_secret_value(SecretId=os.environ["EXTERNAL_API_SECRET"])["SecretString"])
+                      key_id, key_secret = provider_keys.get("RAZORPAY_KEY_ID"), provider_keys.get("RAZORPAY_KEY_SECRET")
+                      if not key_id or not key_secret: return response(503, {"error": "online payments are being configured"})
+                      order_id = "ORD-" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + "-" + str(uuid.uuid4())[:6]
+                      total, amount = round(quantity * float(listing["price"]), 2), int(round(quantity * float(listing["price"]) * 100))
+                      request_data = json.dumps({"amount": amount, "currency": "INR", "receipt": order_id, "notes": {"listingId": listing["listingId"], "customerId": user_id}}).encode()
+                      authorization = "Basic " + base64.b64encode((key_id + ":" + key_secret).encode()).decode()
+                      try:
+                          with urlopen(Request("https://api.razorpay.com/v1/orders", data=request_data, headers={"Authorization": authorization, "Content-Type": "application/json"}, method="POST"), timeout=10) as result: razorpay_order = json.load(result)
+                      except Exception as error:
+                          print("razorpay order error:", repr(error)); return response(502, {"error": "payment service is temporarily unavailable"})
+                      item = {"userId": user_id, "orderId": order_id, "razorpayOrderId": razorpay_order["id"], "listingId": listing["listingId"], "farmerId": listing["farmerId"], "customer": profile.get("name"), "crop": listing["crop"], "quantity": str(quantity), "total": str(total), "status": "Payment pending", "date": datetime.now(timezone.utc).date().isoformat()}
+                      orders_table.put_item(Item=item); return response(201, {**item, "keyId": key_id, "amount": amount, "currency": "INR", "farm": listing.get("farm")})
+              if path == "/payments/verify" and method == "POST":
+                  data = body(event); order_id = str(data.get("orderId", "")); item = orders_table.get_item(Key={"userId": user_id, "orderId": order_id}).get("Item")
+                  if not item or item.get("status") != "Payment pending": return response(404, {"error": "pending order not found"})
+                  payment_id, razorpay_order_id, signature = str(data.get("razorpay_payment_id", "")), str(data.get("razorpay_order_id", "")), str(data.get("razorpay_signature", ""))
+                  if razorpay_order_id != item["razorpayOrderId"]: return response(400, {"error": "payment order mismatch"})
+                  if provider_keys is None: provider_keys = json.loads(secrets.get_secret_value(SecretId=os.environ["EXTERNAL_API_SECRET"])["SecretString"])
+                  expected = hmac.new(provider_keys["RAZORPAY_KEY_SECRET"].encode(), (item["razorpayOrderId"] + "|" + payment_id).encode(), hashlib.sha256).hexdigest()
+                  if not hmac.compare_digest(expected, signature): return response(400, {"error": "payment verification failed"})
+                  listing = listings_table.get_item(Key={"listingId": item["listingId"]}).get("Item", {}); remaining = float(listing.get("quantity", 0)) - float(item["quantity"])
+                  try:
+                      listings_table.update_item(Key={"listingId": item["listingId"]}, UpdateExpression="SET quantity=:remaining, #status=:status", ConditionExpression="quantity=:current AND #status=:available", ExpressionAttributeNames={"#status":"status"}, ExpressionAttributeValues={":remaining":str(remaining), ":current":listing.get("quantity"), ":status":"Sold out" if remaining == 0 else "Available", ":available":"Available"})
+                      orders_table.update_item(Key={"userId": user_id, "orderId": order_id}, UpdateExpression="SET #status=:paid, razorpayPaymentId=:payment", ExpressionAttributeNames={"#status":"status"}, ExpressionAttributeValues={":paid":"Paid", ":payment":payment_id})
+                      return response(200, {"message":"payment verified", "orderId":order_id, "status":"Paid"})
+                  except Exception:
+                      authorization = "Basic " + base64.b64encode((provider_keys["RAZORPAY_KEY_ID"] + ":" + provider_keys["RAZORPAY_KEY_SECRET"]).encode()).decode()
+                      try: urlopen(Request("https://api.razorpay.com/v1/payments/" + payment_id + "/refund", data=b"{}", headers={"Authorization":authorization,"Content-Type":"application/json"}, method="POST"), timeout=10).read()
+                      except Exception as error: print("automatic refund error:", repr(error))
+                      orders_table.update_item(Key={"userId": user_id, "orderId": order_id}, UpdateExpression="SET #status=:status, razorpayPaymentId=:payment", ExpressionAttributeNames={"#status":"status"}, ExpressionAttributeValues={":status":"Refund initiated - stock unavailable", ":payment":payment_id})
+                      return response(409, {"error":"stock changed during payment; an automatic refund was initiated"})
+              if path == "/invoices" and method == "GET":
+                  items = billing_table.query(KeyConditionExpression=Key("userId").eq(user_id), ScanIndexForward=False, Limit=30).get("Items", [])
+                  return response(200, {"items": items})
+              if path == "/invoices" and method == "POST":
+                  data = body(event)
+                  try:
+                      quantity, rate = float(data.get("quantity", 0)), float(data.get("rate", 0))
+                  except (TypeError, ValueError):
+                      return response(400, {"error": "quantity and rate must be numbers"})
+                  if not data.get("buyer") or not data.get("crop") or quantity <= 0 or rate <= 0:
+                      return response(400, {"error": "buyer, crop, positive quantity and rate are required"})
+                  invoice_id, total = "INV-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"), round(quantity * rate, 2)
+                  item = {"userId": user_id, "invoiceId": invoice_id, "buyer": data["buyer"][:100], "crop": data["crop"][:80], "quantity": str(quantity), "rate": str(rate), "total": str(total), "date": datetime.now(timezone.utc).date().isoformat(), "status": "Unpaid"}
+                  key = "invoices/" + invoice_id + ".pdf"
+                  s3.put_object(Bucket=os.environ["ASSETS_BUCKET"], Key=key, Body=simple_pdf(["SMARTFARMER INVOICE", invoice_id, "Buyer: " + item["buyer"], "Crop: " + item["crop"], "Quantity: " + item["quantity"] + " kg", "Rate: INR " + item["rate"], "Total: INR " + item["total"]]), ContentType="application/pdf")
+                  item["pdfKey"] = key
+                  billing_table.put_item(Item=item)
+                  return response(201, {**item, "pdfUrl": s3.generate_presigned_url("get_object", Params={"Bucket": os.environ["ASSETS_BUCKET"], "Key": key}, ExpiresIn=3600)})
+              if path == "/upload-url" and method == "POST":
+                  data = body(event)
+                  content_type = data.get("contentType", "")
+                  if content_type not in ("image/jpeg", "image/png"):
+                      return response(400, {"error": "only JPG and PNG images are supported"})
+                  key = "crops/" + str(uuid.uuid4()) + (".png" if content_type == "image/png" else ".jpg")
+                  url = s3.generate_presigned_url("put_object", Params={"Bucket": os.environ["ASSETS_BUCKET"], "Key": key, "ContentType": content_type}, ExpiresIn=600)
+                  return response(200, {"key": key, "uploadUrl": url})
+              if path == "/crop-analysis" and method == "POST":
+                  data = body(event)
+                  key = str(data.get("key", ""))
+                  if not key.startswith("crops/"):
+                      return response(400, {"error": "valid crop image key is required"})
+                  image = s3.get_object(Bucket=os.environ["ASSETS_BUCKET"], Key=key)["Body"].read()
+                  fmt = "png" if key.endswith(".png") else "jpeg"
+                  result = bedrock.converse(modelId=os.environ["BEDROCK_MODEL_ID"], system=[{"text": "You are a cautious crop-health assistant. Describe visible symptoms, possible causes, and safe next steps. Never claim a certain diagnosis from one image."}], messages=[{"role": "user", "content": [{"image": {"format": fmt, "source": {"bytes": image}}}, {"text": "Analyze this crop image for a farmer in India."}]}])
+                  return response(200, {"analysis": result["output"]["message"]["content"][0]["text"]})
+              if path == "/schemes" and method == "POST":
+                  data = body(event)
+                  prompt = "Find likely Indian government agriculture schemes for a farmer in " + str(data.get("state", "Madhya Pradesh"))[:80] + ", growing " + str(data.get("crop", "wheat"))[:80] + " on " + str(data.get("acres", "12.5"))[:20] + " acres. Give concise eligibility caveats and official verification steps."
+                  result = bedrock.converse(modelId=os.environ["BEDROCK_MODEL_ID"], messages=[{"role": "user", "content": [{"text": prompt}]}])
+                  return response(200, {"answer": result["output"]["message"]["content"][0]["text"]})
+              if path == "/speak" and method == "POST":
+                  text = str(body(event).get("text", ""))[:2500]
+                  if not text:
+                      return response(400, {"error": "text is required"})
+                  audio = boto3.client("polly").synthesize_speech(Text=text, OutputFormat="mp3", VoiceId="Kajal", Engine="neural")["AudioStream"].read()
+                  return response(200, {"audio": base64.b64encode(audio).decode(), "contentType": "audio/mpeg"})
+              if path == "/assistant" and method == "POST":
+                  prompt = json.loads(event.get("body") or "{}").get("question", "").strip()
+                  if not prompt:
+                      return response(400, {"error": "question is required"})
+                  result = bedrock.converse(modelId=os.environ["BEDROCK_MODEL_ID"], system=[{"text": "You are a concise agricultural assistant. Advise users to consult local experts for dangerous or uncertain crop treatments."}], messages=[{"role": "user", "content": [{"text": prompt}]}])
+                  return response(200, {"answer": result["output"]["message"]["content"][0]["text"]})
+              return response(404, {"error": "route not found"})
+
+  ApiFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/smart-farmer-api
+      RetentionInDays: 30
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: smart-farmer-api
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowHeaders: [authorization, content-type]
+        AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: '$default'
+      Target: !Sub integrations/${ApiIntegration}
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogs.Arn
+        Format: '{"requestId":"$context.requestId","status":"$context.status","path":"$context.path"}'
+
+  ApiAccessLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+
+  ApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApiFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*
+
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: smart-farmer-scheduled-alerts
+      ScheduleExpression: rate(6 hours)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ApiFunction.Arn
+          Id: smart-farmer-alerts
+          Input: '{"source":"scheduled-alerts"}'
+
+  SchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApiFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduleRule.Arn
+
+  FarmMap:
+    Type: AWS::Location::Map
+    Properties:
+      MapName: smart-farmer-map
+      Configuration: { Style: VectorEsriNavigation }
+      Description: SmartFarmer farm and field map
+
+  PlaceIndex:
+    Type: AWS::Location::PlaceIndex
+    Properties:
+      IndexName: smart-farmer-places
+      DataSource: Esri
+      Description: SmartFarmer location search
+
+  InteractiveMapKey:
+    Type: AWS::Location::APIKey
+    Properties:
+      KeyName: smart-farmer-interactive-map
+      NoExpiry: true
+      Restrictions:
+        AllowActions: [geo-maps:GetTile]
+        AllowResources:
+          - !Sub arn:aws:geo-maps:${AWS::Region}::provider/default
+  EmailConfigurationSet:
+    Type: AWS::SES::ConfigurationSet
+    Properties:
+      Name: smart-farmer-email
+
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: smart-farmer-web-acl
+      Scope: REGIONAL
+      DefaultAction: { Allow: {} }
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: smart-farmer-web-acl
+        SampledRequestsEnabled: true
+      Rules:
+        - Name: AWSCommonRules
+          Priority: 0
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: smart-farmer-common-rules
+            SampledRequestsEnabled: true
+
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    Properties:
+      Name: smart-farmer
+      Platform: WEB
+      CustomRules:
+        - Source: '/<*>'
+          Target: '/index.html'
+          Status: '404-200'
+
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: main
+      EnableAutoBuild: false
+      Stage: PRODUCTION
+
+Outputs:
+  ApiUrl:
+    Value: !GetAtt HttpApi.ApiEndpoint
+  AssetsBucketName:
+    Value: !Ref AssetsBucket
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  AmplifyAppId:
+    Value: !GetAtt AmplifyApp.AppId
+  AmplifyDefaultDomain:
+    Value: !GetAtt AmplifyApp.DefaultDomain
+  ExternalApiSecretArn:
+    Value: !Ref ExternalApiSecret
+
